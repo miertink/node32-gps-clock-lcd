@@ -1,6 +1,7 @@
 /*
-  node32-gps-clock
-  GPS clock: NodeMCU (ESP8266 / ESP-12E) + CN-06 GPS (u-blox NEO-6M) + round GC9A01 1.28" 240x240 display
+  node32-gps-clock (LCD)
+  GPS clock: NodeMCU (ESP8266 / ESP-12E) + CN-06 GPS (u-blox NEO-6M) + 20x4 HD44780 LCD
+  with a PCF8574 I2C backpack
 
   Wiring
   ---------------------------------------------------------------
@@ -8,41 +9,49 @@
     VCC     ->     VIN (5V)   (module has its own regulator; 3V3 also works)
     GND     ->     GND
     TX      ->     D6 (GPIO12)   SoftwareSerial RX
-    RX      ->     not connected (only needed to configure the GPS)
+    RX      ->     D7 (GPIO13)   SoftwareSerial TX (optional: only to configure the GPS)
 
-  GC9A01           NodeMCU
-    VCC     ->     3V3
+  LCD backpack     NodeMCU
+    VCC     ->     VIN (5V)   (HD44780 needs 5V for usable contrast)
     GND     ->     GND
-    SCL/SCK ->     D5 (GPIO14)   HSPI CLK (fixed)
-    SDA/MOSI->     D7 (GPIO13)   HSPI MOSI (fixed)
-    CS      ->     D1 (GPIO5)
-    DC      ->     D2 (GPIO4)
-    RST     ->     D0 (GPIO16)
-    BLK     ->     3V3 (or leave open if the module has a pull-up)
+    SDA     ->     D2 (GPIO4)
+    SCL     ->     D1 (GPIO5)
   ---------------------------------------------------------------
+  Most backpacks pull SDA/SCL up to VCC (5V). The ESP8266 is a 3.3V part: use a level
+  shifter, or remove the backpack pull-ups and add 4.7k to 3V3. With 3V3 pull-ups the
+  PCF8574 at 5V sees 3.3V as HIGH (V_IH = 0.7 x VCC = 3.5V: marginal, works in practice
+  with short wires).
+
   Deliberately avoided: D3/GPIO0, D4/GPIO2 and D8/GPIO15 are boot strapping pins;
   D9/D10 are UART0 (USB).
 
-  No full framebuffer: the ESP8266 lacks RAM for 240x240x2 = 115 KB.
-  Each field is redrawn only when it changes, through a small (190x46) RAM canvas.
+  Screen
+    +--------------------+
+    |SATURDAY  27/09/2026|
+    |     BR 18:42:10    |
+    |    UTC 21:42:10    |
+    |FIX SAT 7   HDOP 1.1|
+    +--------------------+
 */
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
-#include <U8g2lib.h>              // fonts only (Logisoso, Helvetica)
-#include <Arduino_GFX_Library.h>
+#include <Wire.h>
+#include <hd44780.h>
+#include <hd44780ioClass/hd44780_I2Cexp.h>   // PCF8574 backpack, address and pin map auto-detected
 #include <SoftwareSerial.h>
 #include <TinyGPSPlus.h>
 
 // ---------------------------- Configuration -----------------------------
 constexpr int UTC_OFFSET_MIN = -3 * 60;   // Brasília; no daylight saving time since 2019
 
-constexpr int8_t   PIN_GPS_RX = D6;
+constexpr int8_t   PIN_GPS_RX = D6;          // ESP RX <- GPS TX
+constexpr int8_t   PIN_GPS_TX = D7;          // ESP TX -> GPS RX (configuration only; idles high)
 constexpr uint32_t GPS_BAUD   = 115200;    // CN-06 reconfigured (ex-drone); NEO-6M factory default is 9600
 
-constexpr int8_t PIN_TFT_CS  = D1;
-constexpr int8_t PIN_TFT_DC  = D2;
-constexpr int8_t PIN_TFT_RST = D0;
+constexpr int8_t   PIN_I2C_SDA = D2;
+constexpr int8_t   PIN_I2C_SCL = D1;
+constexpr uint32_t I2C_CLOCK   = 100000;   // PCF8574 is specified for 100 kHz
 
 constexpr uint32_t GPS_STALE_MS = 3000;    // no new sentence for longer than this = stale data
 
@@ -51,22 +60,12 @@ constexpr uint32_t STATUS_EVERY_MS = 1000;   // GPS status interval on the seria
 constexpr bool     GPS_ECHO_NMEA   = false;  // true = forward raw NMEA sentences to the monitor
 
 // ------------------------------- Display --------------------------------
-constexpr int16_t CX = 120, CY = 120;
+constexpr uint8_t LCD_COLS = 20, LCD_ROWS = 4;
 
-Arduino_DataBus *bus = new Arduino_ESP8266SPI(PIN_TFT_DC, PIN_TFT_CS);
-Arduino_GFX     *gfx = new Arduino_GC9A01(bus, PIN_TFT_RST, 0 /*rotation*/, true /*IPS*/);
+enum class Align { Left, Center, Right };
+constexpr Align CLOCK_ALIGN = Align::Right;   // BR / UTC time rows: Align::Left, Align::Center or Align::Right
 
-constexpr uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
-  return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-}
-constexpr uint16_t C_BG   = rgb(0, 0, 0);
-constexpr uint16_t C_TIME = rgb(255, 255, 255);
-constexpr uint16_t C_SEC  = rgb(0, 200, 255);
-constexpr uint16_t C_DATE = rgb(200, 200, 200);
-constexpr uint16_t C_DIM  = rgb(50, 50, 50);
-constexpr uint16_t C_OK   = rgb(0, 220, 0);
-constexpr uint16_t C_WARN = rgb(255, 170, 0);
-constexpr uint16_t C_ERR  = rgb(255, 40, 40);
+hd44780_I2Cexp lcd;
 
 // --------------------------------- GPS ----------------------------------
 TinyGPSPlus    gps;
@@ -117,83 +116,42 @@ static LocalTime utcToLocal(int y, int mo, int d, int h, int mi, int s) {
   return lt;
 }
 
-// ------------------------ Incremental field drawing ---------------------
-// Each field remembers what is on screen and is redrawn only when its text changes.
-// Text is rendered into a small RAM canvas and pushed to the display in one go:
-// proportional fonts without flicker, and no full-screen framebuffer needed.
-//
-// Each field has its own width, centered on X. Because the screen is round, the free
-// width inside the seconds ring shrinks away from the center: the time (middle) can
-// be 190 px wide, the status line (bottom) only ~110 px.
-constexpr int16_t FIELD_MAX_W = 190;
-constexpr int16_t FIELD_MAX_H = 46;
+// ------------------------- Incremental row drawing ----------------------
+// The LCD keeps its own content, so only the characters that differ from what is on
+// screen are sent. A normal second changes 1-2 characters per row: little I2C traffic,
+// so SoftwareSerial (interrupt driven) does not lose GPS bytes during an update.
+static char shown[LCD_ROWS][LCD_COLS];
 
-Arduino_Canvas *fieldCanvas = new Arduino_Canvas(FIELD_MAX_W, FIELD_MAX_H, nullptr);   // ~17 KB
+// Writes txt starting at column col (0-based); the rest of the row is blanked.
+// Text that does not fit is clipped at the right edge.
+static void setRow(uint8_t row, const char *txt, uint8_t col) {
+  char line[LCD_COLS];
+  memset(line, ' ', LCD_COLS);
 
-struct Field {
-  int16_t        top, w, h;
-  const uint8_t *font;      // U8g2 font
-  const char    *layout;    // if set, center using this text instead (fixed position, no jitter)
-  char           shown[24];
-  uint16_t       shownColor;
-};
-
-enum Slot { F_TOP, F_DATE, F_MAIN, F_UTC, F_STATUS, F_COUNT };   // same order as the table below
-static Field fields[F_COUNT] = {
-  { 40, 140, 20, u8g2_font_helvR14_tr,    nullptr,    "", 0},   // weekday
-  { 64, 150, 20, u8g2_font_helvR14_tr,    nullptr,    "", 0},   // date / message
-  { 97, 190, 46, u8g2_font_logisoso42_tn, "88:88:88", "", 0},   // HH:MM:SS, centered on y=120
-  {158, 170, 30, u8g2_font_logisoso20_tr, nullptr,    "", 0},   // UTC HH:MM
-  {200, 110, 14, u8g2_font_helvB08_tr,    nullptr,    "", 0},   // status
-};
-
-static void setField(Slot slot, const char *txt, uint16_t color) {
-  Field &f = fields[slot];
-  if (strcmp(f.shown, txt) == 0 && f.shownColor == color) return;
-
-  fieldCanvas->fillRect(0, 0, f.w, f.h, C_BG);
-  fieldCanvas->setFont(f.font);
-  fieldCanvas->setTextColor(color);
-
-  int16_t x1, y1;
-  uint16_t w, h;
-  fieldCanvas->getTextBounds(f.layout ? f.layout : txt, 0, 0, &x1, &y1, &w, &h);
-  fieldCanvas->setCursor((f.w - (int16_t)w) / 2 - x1, (f.h - (int16_t)h) / 2 - y1);  // center
-  fieldCanvas->print(txt);
-
-  // Push only the w x h rectangle of the canvas (row by row, since the canvas is wider)
-  const uint16_t *fb = fieldCanvas->getFramebuffer();
-  const int16_t   x  = CX - f.w / 2;
-  for (int16_t row = 0; row < f.h; row++) {
-    gfx->draw16bitRGBBitmap(x, f.top + row, (uint16_t *)fb + row * FIELD_MAX_W, f.w, 1);
+  if (col < LCD_COLS) {
+    memcpy(line + col, txt, min(strlen(txt), (size_t)(LCD_COLS - col)));
   }
 
-  strlcpy(f.shown, txt, sizeof(f.shown));
-  f.shownColor = color;
-}
-
-static void clearFields() {
-  gfx->fillScreen(C_BG);
-  for (auto &f : fields) f.shown[0] = '\0';
-}
-
-// Ring of 60 dots along the edge; lit up to the current second
-static int ringShown = -2;   // -2 = not drawn
-
-static void drawRingDot(int i, uint16_t color) {
-  constexpr float R = 112;
-  const float a = (i * 6 - 90) * DEG_TO_RAD;
-  gfx->fillCircle(CX + R * cosf(a), CY + R * sinf(a), (i % 5) == 0 ? 4 : 2, color);
-}
-
-static void setRing(int sec) {   // sec = -1 turns all dots off
-  if (sec == ringShown) return;
-  if (ringShown < -1 || sec < ringShown) {        // first draw or minute rollover
-    for (int i = 0; i < 60; i++) drawRingDot(i, i <= sec ? C_SEC : C_DIM);
-  } else {
-    for (int i = ringShown + 1; i <= sec; i++) drawRingDot(i, C_SEC);
+  int cursor = -1;   // column the LCD cursor is at, -1 = unknown
+  for (uint8_t c = 0; c < LCD_COLS; c++) {
+    if (line[c] == shown[row][c]) continue;
+    if (cursor != c) lcd.setCursor(c, row);
+    lcd.write(line[c]);
+    cursor = c + 1;
   }
-  ringShown = sec;
+  memcpy(shown[row], line, LCD_COLS);
+}
+
+static void setRow(uint8_t row, const char *txt, Align align = Align::Left) {
+  const size_t len = min(strlen(txt), (size_t)LCD_COLS);
+  setRow(row, txt, (uint8_t)(align == Align::Center ? (LCD_COLS - len) / 2
+                           : align == Align::Right  ? LCD_COLS - len
+                                                    : 0));
+}
+
+static void clearRows() {
+  lcd.clear();
+  memset(shown, ' ', sizeof(shown));
 }
 
 // ------------------------------- Screens --------------------------------
@@ -203,13 +161,12 @@ static Screen screen = Screen::None;
 static void enterScreen(Screen s) {
   if (screen == s) return;
   screen = s;
-  clearFields();
-  ringShown = -2;
+  clearRows();
 }
 
 static void render() {
   static const char *WEEKDAYS[] = {"SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"};
-  char buf[24];
+  char buf[32];
 
   const bool noData    = millis() > 5000 && gps.charsProcessed() < 10;
   const bool timeValid = gps.time.isValid() && gps.date.isValid() &&
@@ -218,15 +175,14 @@ static void render() {
 
   if (!timeValid) {
     enterScreen(noData ? Screen::NoData : Screen::Waiting);
-    setRing(-1);
-    setField(F_MAIN, "--:--:--", C_DIM);
+    setRow(1, "--:--:--", Align::Center);
     if (noData) {
-      setField(F_DATE, "NO GPS DATA", C_ERR);
-      setField(F_STATUS, "check TX -> D6", C_ERR);
+      setRow(0, "NO GPS DATA", Align::Center);
+      setRow(3, "check TX -> D6", Align::Center);
     } else {
-      setField(F_DATE, "WAITING", C_WARN);
+      setRow(0, "WAITING FOR GPS", Align::Center);
       snprintf(buf, sizeof(buf), "SAT %lu", (unsigned long)gps.satellites.value());
-      setField(F_STATUS, buf, C_WARN);
+      setRow(3, buf, Align::Center);
     }
     return;
   }
@@ -236,22 +192,24 @@ static void render() {
   const LocalTime lt = utcToLocal(gps.date.year(), gps.date.month(), gps.date.day(),
                                   gps.time.hour(), gps.time.minute(), gps.time.second());
 
-  setRing(lt.second);
-  setField(F_TOP, WEEKDAYS[lt.weekday], C_DATE);
+  // Weekday (max 9 chars) + space + date (10 chars) = exactly 20
+  snprintf(buf, sizeof(buf), "%-9s %02u/%02u/%04d", WEEKDAYS[lt.weekday], lt.day, lt.month, lt.year);
+  setRow(0, buf);
 
-  snprintf(buf, sizeof(buf), "%02u:%02u:%02u", lt.hour, lt.minute, lt.second);
-  setField(F_MAIN, buf, C_TIME);
+  snprintf(buf, sizeof(buf), " BR %02u:%02u:%02u", lt.hour, lt.minute, lt.second);
+  setRow(1, buf, Align::Center);
 
-  snprintf(buf, sizeof(buf), "UTC %02u:%02u", gps.time.hour(), gps.time.minute());
-  setField(F_UTC, buf, C_SEC);
-
-  snprintf(buf, sizeof(buf), "%02u/%02u/%04d", lt.day, lt.month, lt.year);
-  setField(F_DATE, buf, C_DATE);
+  snprintf(buf, sizeof(buf), "UTC %02u:%02u:%02u", gps.time.hour(), gps.time.minute(), gps.time.second());
+  setRow(2, buf, Align::Center);
 
   // Before a fix, time comes from the GPS internal RTC and may be off by a few seconds
-  snprintf(buf, sizeof(buf), "%s  SAT %lu", hasFix ? "FIX" : "NO FIX",
-           (unsigned long)gps.satellites.value());
-  setField(F_STATUS, buf, hasFix ? C_OK : C_WARN);
+  if (hasFix) {
+    snprintf(buf, sizeof(buf), "FIX SAT %-2lu  HDOP %.1f", (unsigned long)gps.satellites.value(),
+             gps.hdop.isValid() ? gps.hdop.hdop() : 99.9);
+  } else {
+    snprintf(buf, sizeof(buf), "NO FIX  SAT %lu", (unsigned long)gps.satellites.value());
+  }
+  setRow(3, buf, Align::Center);
 }
 
 // ---------------------------- Serial status -----------------------------
@@ -292,22 +250,21 @@ void setup() {
   WiFi.mode(WIFI_OFF);
   WiFi.forceSleepBegin();
 
-  if (!gfx->begin()) {
-    Serial.println("Display init failed");
-    while (true) delay(1000);
-  }
-  if (!fieldCanvas->begin(GFX_SKIP_OUTPUT_BEGIN)) {
-    Serial.println("Not enough RAM for the field canvas");
-    while (true) delay(1000);
-  }
-  gfx->fillScreen(C_BG);
-  setField(F_MAIN, "GPS", C_TIME);
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  Wire.setClock(I2C_CLOCK);
 
-  // Must come AFTER gfx->begin(): SPI.begin() switches GPIO12 (D6) to its MISO function
-  // and SoftwareSerial stops receiving. The display is write-only and doesn't need MISO.
-  // RX only. 512 B buffer (~45 ms at 115200): each field is pushed in a few ms.
-  // SoftwareSerial's internal edge buffer is ~5x this size in uint32, so be careful when increasing it.
-  gpsSerial.begin(GPS_BAUD, SWSERIAL_8N1, PIN_GPS_RX, -1, false, 512);
+  // begin() returns 0 on success; error codes are in hd44780.h (e.g. no I2C device found)
+  const int status = lcd.begin(LCD_COLS, LCD_ROWS);
+  if (status) {
+    Serial.printf("LCD init failed (status %d): check SDA->D2, SCL->D1, 5V and pull-ups\n", status);
+    hd44780::fatalError(status);   // blinks the built-in LED, never returns
+  }
+  clearRows();
+  setRow(1, "GPS CLOCK", Align::Center);
+
+  // 512 B RX buffer (~45 ms at 115200), far longer than an LCD update takes.
+  // TX is only used to send configuration commands to the GPS.
+  gpsSerial.begin(GPS_BAUD, SWSERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX, false, 512);
 
   Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
 }
