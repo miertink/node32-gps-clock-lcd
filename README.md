@@ -101,6 +101,28 @@ setRow(2, buf, Align::Center);   // Align::Left | Align::Center | Align::Right
 setRow(2, buf, 8);               // start at column 8, clipped at column 20
 ```
 
+## HDOP
+
+HDOP (Horizontal Dilution of Precision) describes how good the satellite geometry is
+for a horizontal position. Satellites spread across the sky give a low HDOP; satellites
+bunched together (e.g. only one side of the sky visible from a window) give a high HDOP.
+It is a multiplier, not a distance: the horizontal error is roughly HDOP x the receiver's
+base error (a few meters for the NEO-6M).
+
+| HDOP | Rating | Meaning |
+|---|---|---|
+| < 1 | Ideal | Best possible geometry |
+| 1 - 2 | Excellent | Typical with open sky and 7+ satellites |
+| 2 - 5 | Good | Normal for navigation |
+| 5 - 10 | Moderate | Position usable, but noticeably off |
+| 10 - 20 | Fair | Rough position only |
+| > 20 | Poor | Position unreliable |
+| 99.9 | No value | No HDOP received yet (no fix) |
+
+HDOP only shows up on the status line once there is a fix. It describes the position,
+not the time: the displayed time is accurate to the second whenever there is a fix,
+even with a high HDOP.
+
 ## Serial diagnostics
 
 ```
