@@ -56,6 +56,7 @@ constexpr int UTC_OFFSET_MIN = -3 * 60;   // Brasília; no daylight saving time 
 constexpr int8_t   PIN_GPS_RX  = D6;         // ESP RX <- GPS TX
 constexpr int8_t   PIN_GPS_TX  = D7;         // ESP TX -> GPS RX (configuration only; idles high)
 constexpr int8_t   PIN_GPS_PPS = D5;         // GPS PPS, 1 pulse per second once there is a fix
+constexpr bool     PPS_ACTIVE_HIGH = true;   // second starts at the rising edge (false = falling)
 constexpr uint32_t GPS_BAUD    = 9600;       // ATGM336H factory default
 
 constexpr int8_t   PIN_I2C_SDA = D2;
@@ -134,12 +135,31 @@ static int64_t  nmeaEpoch = 0;     // UTC
 static uint32_t nmeaUs    = 0;     // micros() when it was parsed
 
 // PPS: written by the interrupt
-static volatile uint32_t ppsEdgeUs = 0;
+static volatile uint32_t ppsEdgeUs = 0;   // last active edge (start of the second)
 static volatile uint32_t ppsEdges  = 0;
+static volatile uint32_t ppsRiseUs = 0;   // both edges, to measure the pulse (diagnostics)
+static volatile uint32_t ppsFallUs = 0;
 
 static IRAM_ATTR void onPps() {
-  ppsEdgeUs = micros();
-  ppsEdges++;
+  const uint32_t now  = micros();
+  const bool     high = digitalRead(PIN_GPS_PPS) == HIGH;
+  if (high) ppsRiseUs = now; else ppsFallUs = now;
+  if (high == PPS_ACTIVE_HIGH) {
+    ppsEdgeUs = now;
+    ppsEdges++;
+  }
+}
+
+// Time the PPS line stays HIGH, in ms (-1 = not measured yet). ~100 ms with an
+// active-high pulse; ~900 ms means the pulse is inverted (set PPS_ACTIVE_HIGH = false).
+static int32_t ppsHighMs() {
+  noInterrupts();
+  const uint32_t rise = ppsRiseUs, fall = ppsFallUs;
+  interrupts();
+  static int32_t last = -1;
+  const uint32_t high = fall - rise;   // valid only if the fall came after the rise
+  if (rise != 0 && fall != 0 && high < 1000000) last = high / 1000;
+  return last;
 }
 
 // PPS: processed in loop()
@@ -304,8 +324,9 @@ static void printStatus() {
     Serial.print(F("NO FIX | "));
   }
 
-  Serial.printf("pps=%s edges=%lu nmea+%ldms mism=%lu | ", ppsLocked() ? "LOCK" : "off",
-                (unsigned long)lastEdgeCount, (long)nmeaDelayMs, (unsigned long)ppsMismatches);
+  Serial.printf("pps=%s edges=%lu high=%ldms nmea+%ldms mism=%lu | ", ppsLocked() ? "LOCK" : "off",
+                (unsigned long)lastEdgeCount, (long)ppsHighMs(), (long)nmeaDelayMs,
+                (unsigned long)ppsMismatches);
 
   if (nmeaValid) {
     const CivilTime utc = fromEpoch(nmeaEpoch);
@@ -345,7 +366,8 @@ void setup() {
 
   // Pull-up keeps the input quiet if PPS is not wired; the module drives it push-pull
   pinMode(PIN_GPS_PPS, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(PIN_GPS_PPS), onPps, RISING);
+  // Both edges: the active one marks the second, the other measures the pulse width
+  attachInterrupt(digitalPinToInterrupt(PIN_GPS_PPS), onPps, CHANGE);
 
   Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
 }

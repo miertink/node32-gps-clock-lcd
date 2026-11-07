@@ -83,8 +83,8 @@ Without PPS (no fix yet, or PPS not wired) the clock falls back to updating when
 sentence arrives, and the status line shows `FIX` instead of `PPS`.
 
 This assumes the receiver sends each RMC *after* the pulse it describes, which is the
-usual convention. Check it once against a reference clock (e.g. time.is): the seconds
-must turn over together, not 1 s apart.
+usual convention. Verified on the ATGM336H against time.is: the seconds turn over
+together, within a few ms (the LCD itself takes ~100-200 ms to change).
 
 ## Build and upload
 
@@ -111,6 +111,7 @@ All settings are at the top of [src/main.cpp](src/main.cpp):
 | `UTC_OFFSET_MIN` | `-180` | Local offset from UTC in minutes |
 | `PIN_GPS_RX` / `PIN_GPS_TX` | `D6` / `D7` | GPS serial pins (ESP side) |
 | `PIN_GPS_PPS` | `D5` | GPS PPS input |
+| `PPS_ACTIVE_HIGH` | `true` | The second starts at the rising edge (`false` = falling edge, for an inverted pulse) |
 | `GPS_BAUD` | `9600` | GPS serial baud rate (ATGM336H factory default) |
 | `PIN_I2C_SDA` / `PIN_I2C_SCL` | `D2` / `D1` | I2C pins |
 | `I2C_CLOCK` | `100000` | I2C clock (the PCF8574 is specified for 100 kHz) |
@@ -160,11 +161,13 @@ even with a high HDOP.
 ## Serial diagnostics
 
 ```
-[GPS] chars=13194 ok=486 err=0 | sat=9 hdop=1.1 | FIX -23.03,-46.97 alt=690m | pps=LOCK edges=412 nmea+310ms mism=0 | UTC 2026-09-27 21:42:10 (age 312ms)
+[GPS] chars=13194 ok=486 err=0 | sat=9 hdop=1.1 | FIX -23.03,-46.97 alt=690m | pps=LOCK edges=412 high=100ms nmea+310ms mism=0 | UTC 2026-09-27 21:42:10 (age 312ms)
 ```
 
-`nmea+310ms` is how long after the PPS edge the RMC sentence was parsed: this is the
-delay the PPS removes from the display.
+`high=100ms` is how long the PPS line stays high: about 100 ms for a normal pulse; about
+900 ms means the pulse is inverted (set `PPS_ACTIVE_HIGH = false`). `nmea+310ms` is how
+long after the PPS edge the RMC sentence was parsed: this is the delay the PPS removes
+from the display.
 
 | Symptom | Likely cause |
 |---|---|
