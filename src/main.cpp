@@ -1,15 +1,16 @@
 /*
   node32-gps-clock (LCD)
-  GPS clock: NodeMCU (ESP8266 / ESP-12E) + CN-06 GPS (u-blox NEO-6M) + 20x4 HD44780 LCD
-  with a PCF8574 I2C backpack
+  GPS clock: NodeMCU (ESP8266 / ESP-12E) + ATGM336H GNSS receiver (GPS + BeiDou) + 20x4
+  HD44780 LCD with a PCF8574 I2C backpack. The PPS output aligns the seconds.
 
   Wiring
   ---------------------------------------------------------------
-  CN-06 GPS        NodeMCU
-    VCC     ->     VIN (5V)   (module has its own regulator; 3V3 also works)
+  ATGM336H         NodeMCU
+    VCC     ->     3V3        (safe for both bare modules and breakouts with a regulator)
     GND     ->     GND
     TX      ->     D6 (GPIO12)   SoftwareSerial RX
     RX      ->     D7 (GPIO13)   SoftwareSerial TX (optional: only to configure the GPS)
+    PPS     ->     D5 (GPIO14)   interrupt, rising edge = start of the UTC second
 
   LCD backpack     NodeMCU
     VCC     ->     VIN (5V)   (HD44780 needs 5V for usable contrast)
@@ -23,14 +24,21 @@
   with short wires).
 
   Deliberately avoided: D3/GPIO0, D4/GPIO2 and D8/GPIO15 are boot strapping pins;
-  D9/D10 are UART0 (USB).
+  D9/D10 are UART0 (USB); D0/GPIO16 has no interrupt (cannot take PPS).
+
+  How the time is kept
+    NMEA tells WHICH second it is, but arrives 100-500 ms after the second started (and
+    the delay varies). PPS marks EXACTLY when the second starts, but carries no label.
+    With a fix, each PPS edge shows (time of the last RMC sentence + 1 s), so the LCD
+    turns over at the true second. Without PPS (no fix, or not wired) the clock falls
+    back to updating on NMEA arrival.
 
   Screen
     +--------------------+
     |SATURDAY  27/09/2026|
     |     BR 18:42:10    |
     |    UTC 21:42:10    |
-    |FIX SAT 7   HDOP 1.1|
+    |PPS SAT 9  HDOP  1.1|
     +--------------------+
 */
 
@@ -45,9 +53,10 @@
 // ---------------------------- Configuration -----------------------------
 constexpr int UTC_OFFSET_MIN = -3 * 60;   // Brasília; no daylight saving time since 2019
 
-constexpr int8_t   PIN_GPS_RX = D6;          // ESP RX <- GPS TX
-constexpr int8_t   PIN_GPS_TX = D7;          // ESP TX -> GPS RX (configuration only; idles high)
-constexpr uint32_t GPS_BAUD   = 115200;    // CN-06 reconfigured (ex-drone); NEO-6M factory default is 9600
+constexpr int8_t   PIN_GPS_RX  = D6;         // ESP RX <- GPS TX
+constexpr int8_t   PIN_GPS_TX  = D7;         // ESP TX -> GPS RX (configuration only; idles high)
+constexpr int8_t   PIN_GPS_PPS = D5;         // GPS PPS, 1 pulse per second once there is a fix
+constexpr uint32_t GPS_BAUD    = 9600;       // ATGM336H factory default
 
 constexpr int8_t   PIN_I2C_SDA = D2;
 constexpr int8_t   PIN_I2C_SCL = D1;
@@ -72,7 +81,7 @@ TinyGPSPlus    gps;
 SoftwareSerial gpsSerial;
 
 // ------------------------------ Date/time -------------------------------
-struct LocalTime {
+struct CivilTime {
   int year; uint8_t month, day, hour, minute, second, weekday;  // weekday 0 = Sunday
 };
 
@@ -98,22 +107,75 @@ static void civilFromDays(int32_t z, int &y, uint8_t &m, uint8_t &d) {
   y = (int)yoe + era * 400 + (m <= 2);
 }
 
-// Converts GPS UTC to local time using the offset (handles day/month/year rollover)
-static LocalTime utcToLocal(int y, int mo, int d, int h, int mi, int s) {
-  int64_t t = (int64_t)daysFromCivil(y, mo, d) * 86400 + h * 3600 + mi * 60 + s;
-  t += (int64_t)UTC_OFFSET_MIN * 60;
+// Seconds since 1970-01-01 00:00:00
+static int64_t toEpoch(int y, int mo, int d, int h, int mi, int s) {
+  return (int64_t)daysFromCivil(y, mo, d) * 86400 + h * 3600 + mi * 60 + s;
+}
 
+// Splits epoch seconds into date and time (handles day/month/year rollover)
+static CivilTime fromEpoch(int64_t t) {
   int32_t days = (int32_t)(t / 86400);
   int32_t secs = (int32_t)(t % 86400);
   if (secs < 0) { secs += 86400; days--; }
 
-  LocalTime lt;
-  civilFromDays(days, lt.year, lt.month, lt.day);
-  lt.hour    = secs / 3600;
-  lt.minute  = (secs / 60) % 60;
-  lt.second  = secs % 60;
-  lt.weekday = (uint8_t)(((days % 7) + 11) % 7);   // 1970-01-01 was a Thursday (4)
-  return lt;
+  CivilTime ct;
+  civilFromDays(days, ct.year, ct.month, ct.day);
+  ct.hour    = secs / 3600;
+  ct.minute  = (secs / 60) % 60;
+  ct.second  = secs % 60;
+  ct.weekday = (uint8_t)(((days % 7) + 11) % 7);   // 1970-01-01 was a Thursday (4)
+  return ct;
+}
+
+// -------------------------------- Timing --------------------------------
+// NMEA: the last RMC sentence (date + time in one sentence, so no midnight mix-ups)
+static bool     nmeaValid = false;
+static int64_t  nmeaEpoch = 0;     // UTC
+static uint32_t nmeaUs    = 0;     // micros() when it was parsed
+
+// PPS: written by the interrupt
+static volatile uint32_t ppsEdgeUs = 0;
+static volatile uint32_t ppsEdges  = 0;
+
+static IRAM_ATTR void onPps() {
+  ppsEdgeUs = micros();
+  ppsEdges++;
+}
+
+// PPS: processed in loop()
+static bool     ppsValid      = false;   // ppsEpoch labels the last edge correctly
+static int64_t  ppsEpoch      = 0;       // UTC second that started at the last edge
+static uint32_t lastEdgeUs    = 0;
+static uint32_t lastEdgeCount = 0;
+static uint32_t ppsMismatches = 0;       // times NMEA disagreed with the PPS count
+static int32_t  nmeaDelayMs   = -1;      // last PPS edge -> RMC parsed (diagnostics)
+
+static bool ppsLocked() {
+  return ppsValid && micros() - lastEdgeUs < 1100000;
+}
+
+// Called for every new PPS edge. Returns true if the edge is a valid second boundary.
+static bool processPpsEdge(uint32_t edgeUs, uint32_t edgeCount) {
+  const uint32_t interval = edgeUs - lastEdgeUs;
+  const uint32_t prevUs   = lastEdgeUs;
+  // Exactly one edge, ~1 s after the previous one: rejects noise and a floating input
+  const bool regular = edgeCount - lastEdgeCount == 1 && interval > 900000 && interval < 1100000;
+  lastEdgeUs    = edgeUs;
+  lastEdgeCount = edgeCount;
+
+  if (!regular) { ppsValid = false; return false; }
+
+  if (ppsValid) ppsEpoch++;   // flywheel: one more second
+
+  // The RMC that arrived after the previous edge described that edge's second, so this
+  // edge is that second + 1. Check (and if needed correct) the running count.
+  if (nmeaValid && nmeaUs - prevUs < interval) {
+    const int64_t expected = nmeaEpoch + 1;
+    if (ppsValid && ppsEpoch != expected) ppsMismatches++;
+    ppsEpoch = expected;
+    ppsValid = true;
+  }
+  return ppsValid;
 }
 
 // ------------------------- Incremental row drawing ----------------------
@@ -164,16 +226,15 @@ static void enterScreen(Screen s) {
   clearRows();
 }
 
-static void render() {
+// haveTime = utcEpoch is a valid current UTC time
+static void render(bool haveTime, int64_t utcEpoch) {
   static const char *WEEKDAYS[] = {"SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"};
   char buf[32];
 
-  const bool noData    = millis() > 5000 && gps.charsProcessed() < 10;
-  const bool timeValid = gps.time.isValid() && gps.date.isValid() &&
-                         gps.date.year() >= 2020 && gps.time.age() < GPS_STALE_MS;
-  const bool hasFix    = gps.location.isValid() && gps.location.age() < GPS_STALE_MS;
+  const bool noData = millis() > 5000 && gps.charsProcessed() < 10;
+  const bool hasFix = gps.location.isValid() && gps.location.age() < GPS_STALE_MS;
 
-  if (!timeValid) {
+  if (!haveTime) {
     enterScreen(noData ? Screen::NoData : Screen::Waiting);
     setRow(1, "--:--:--", Align::Center);
     if (noData) {
@@ -189,8 +250,8 @@ static void render() {
 
   enterScreen(Screen::Clock);
 
-  const LocalTime lt = utcToLocal(gps.date.year(), gps.date.month(), gps.date.day(),
-                                  gps.time.hour(), gps.time.minute(), gps.time.second());
+  const CivilTime lt  = fromEpoch(utcEpoch + (int64_t)UTC_OFFSET_MIN * 60);
+  const CivilTime utc = fromEpoch(utcEpoch);
 
   // Weekday (max 9 chars) + space + date (10 chars) = exactly 20
   snprintf(buf, sizeof(buf), "%-9s %02u/%02u/%04d", WEEKDAYS[lt.weekday], lt.day, lt.month, lt.year);
@@ -199,17 +260,29 @@ static void render() {
   snprintf(buf, sizeof(buf), " BR %02u:%02u:%02u", lt.hour, lt.minute, lt.second);
   setRow(1, buf, Align::Center);
 
-  snprintf(buf, sizeof(buf), "UTC %02u:%02u:%02u", gps.time.hour(), gps.time.minute(), gps.time.second());
+  snprintf(buf, sizeof(buf), "UTC %02u:%02u:%02u", utc.hour, utc.minute, utc.second);
   setRow(2, buf, Align::Center);
 
-  // Before a fix, time comes from the GPS internal RTC and may be off by a few seconds
+  // PPS = fix and seconds aligned to the pulse. FIX = fix, NMEA timing only.
+  // Before a fix, time comes from the GPS internal RTC and may be off by a few seconds.
+  // Fixed width (20): "PPS SAT 9  HDOP  1.1" / "FIX SAT 12 HDOP 12.3"
   if (hasFix) {
-    snprintf(buf, sizeof(buf), "FIX SAT %-2lu  HDOP %.1f", (unsigned long)gps.satellites.value(),
-             gps.hdop.isValid() ? gps.hdop.hdop() : 99.9);
+    const double hdop = gps.hdop.isValid() ? min(gps.hdop.hdop(), 99.9) : 99.9;
+    snprintf(buf, sizeof(buf), "%s SAT %-2lu HDOP %4.1f", ppsLocked() ? "PPS" : "FIX",
+             (unsigned long)min(gps.satellites.value(), (uint32_t)99), hdop);
   } else {
     snprintf(buf, sizeof(buf), "NO FIX  SAT %lu", (unsigned long)gps.satellites.value());
   }
   setRow(3, buf, Align::Center);
+}
+
+// Redraw with the best time available: PPS-aligned if locked, else the last RMC
+static void renderNow() {
+  if (ppsLocked()) {
+    render(true, ppsEpoch);
+  } else {
+    render(nmeaValid && micros() - nmeaUs < GPS_STALE_MS * 1000, nmeaEpoch);
+  }
 }
 
 // ---------------------------- Serial status -----------------------------
@@ -217,6 +290,7 @@ static void render() {
 //   chars not increasing       -> nothing arrives from the GPS (TX->D6 wiring / power)
 //   chars up, ok=0, err up     -> garbage arrives (wrong baud rate or noise)
 //   ok up, no fix              -> GPS works, needs open sky / time
+//   fix, pps=off, edges=0      -> check PPS -> D5 (the pulse only starts after a fix)
 static void printStatus() {
   Serial.printf("[GPS] chars=%lu ok=%lu err=%lu | sat=%lu hdop=%.1f | ",
                 (unsigned long)gps.charsProcessed(), (unsigned long)gps.passedChecksum(),
@@ -230,11 +304,14 @@ static void printStatus() {
     Serial.print(F("NO FIX | "));
   }
 
-  if (gps.time.isValid() && gps.date.isValid()) {
-    Serial.printf("UTC %04u-%02u-%02u %02u:%02u:%02u (age %lums)\n",
-                  gps.date.year(), gps.date.month(), gps.date.day(),
-                  gps.time.hour(), gps.time.minute(), gps.time.second(),
-                  (unsigned long)gps.time.age());
+  Serial.printf("pps=%s edges=%lu nmea+%ldms mism=%lu | ", ppsLocked() ? "LOCK" : "off",
+                (unsigned long)lastEdgeCount, (long)nmeaDelayMs, (unsigned long)ppsMismatches);
+
+  if (nmeaValid) {
+    const CivilTime utc = fromEpoch(nmeaEpoch);
+    Serial.printf("UTC %04d-%02u-%02u %02u:%02u:%02u (age %lums)\n",
+                  utc.year, utc.month, utc.day, utc.hour, utc.minute, utc.second,
+                  (unsigned long)((micros() - nmeaUs) / 1000));
   } else {
     Serial.println(F("time invalid"));
   }
@@ -262,9 +339,13 @@ void setup() {
   clearRows();
   setRow(1, "GPS CLOCK", Align::Center);
 
-  // 512 B RX buffer (~45 ms at 115200), far longer than an LCD update takes.
+  // 512 B RX buffer (~0.5 s at 9600), far longer than an LCD update takes.
   // TX is only used to send configuration commands to the GPS.
   gpsSerial.begin(GPS_BAUD, SWSERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX, false, 512);
+
+  // Pull-up keeps the input quiet if PPS is not wired; the module drives it push-pull
+  pinMode(PIN_GPS_PPS, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_GPS_PPS), onPps, RISING);
 
   Serial.printf("Free heap: %u bytes\n", ESP.getFreeHeap());
 }
@@ -277,16 +358,38 @@ void loop() {
     if (GPS_ECHO_NMEA) Serial.write(c);
   }
 
-  // Redraw when a new GPS time arrives (1 Hz) or every 1 s to refresh the status
   static uint32_t lastDraw = 0;
-  const bool newTime = gps.time.isUpdated();
-  if (newTime) gps.time.value();   // clear the flag even if render() doesn't read the time
-  if (newTime || millis() - lastDraw > 1000) {
-    lastDraw = millis();
-    render();
+
+  // New RMC: date and time are updated together only by RMC (GGA has no date)
+  if (gps.date.isUpdated()) {
+    gps.date.value();   // clear the flags
+    gps.time.value();
+    if (gps.date.isValid() && gps.time.isValid() && gps.date.year() >= 2020) {
+      nmeaEpoch   = toEpoch(gps.date.year(), gps.date.month(), gps.date.day(),
+                            gps.time.hour(), gps.time.minute(), gps.time.second());
+      nmeaUs      = micros();
+      nmeaValid   = true;
+      nmeaDelayMs = ppsLocked() ? (int32_t)((nmeaUs - lastEdgeUs) / 1000) : -1;
+      // Without PPS the NMEA arrival is the best second boundary we have
+      if (!ppsLocked()) { lastDraw = millis(); renderNow(); }
+    }
   }
 
-  // After render(): printStatus() reads the time and would clear the isUpdated flag
+  // New PPS edge: the second starts now
+  noInterrupts();
+  const uint32_t edgeUs = ppsEdgeUs, edgeCount = ppsEdges;
+  interrupts();
+  if (edgeCount != lastEdgeCount && processPpsEdge(edgeUs, edgeCount)) {
+    lastDraw = millis();
+    render(true, ppsEpoch);
+  }
+
+  // Fallback: keep status and state changes (lost fix, no data) on screen
+  if (millis() - lastDraw > 1100) {
+    lastDraw = millis();
+    renderNow();
+  }
+
   static uint32_t lastStatus = 0;
   if (millis() - lastStatus >= STATUS_EVERY_MS) {
     lastStatus = millis();
